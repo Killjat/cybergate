@@ -6,7 +6,7 @@ import axios from 'axios';
 
 const { Header, Content } = Layout;
 const { Option } = Select;
-const API = (process.env.REACT_APP_API_URL || 'http://localhost:8080') + '/api';
+const API = (process.env.REACT_APP_API_URL !== undefined ? process.env.REACT_APP_API_URL : '') + '/api';
 
 interface Account { id: number; platform: string; username: string; password: string; two_factor_secret?: string; notes?: string; }
 interface LoginState { status: 'idle' | 'running' | 'success' | 'failed'; message: string; }

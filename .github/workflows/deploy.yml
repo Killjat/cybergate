@@ -1,0 +1,65 @@
+name: Deploy CyberGate
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: 构建前端
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+        env:
+          REACT_APP_API_URL: ""
+
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            # 拉取最新后端代码
+            cd /opt/cybergate
+            git pull origin master
+
+            # 安装后端依赖
+            cd /opt/cybergate/backend
+            pip3 install -r requirements.txt -q
+
+            # 重启后端
+            pkill -f "uvicorn" || true
+            sleep 1
+            nohup python3 -c "
+            import uvicorn, asyncio, sys
+            sys.path.insert(0, '.')
+            from main import app
+            async def run():
+                config = uvicorn.Config(app, host='127.0.0.1', port=8080)
+                await uvicorn.Server(config).serve()
+            asyncio.run(run())
+            " > /var/log/cybergate.log 2>&1 &
+            echo "后端已重启"
+
+      - name: 上传前端 build
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          password: ${{ secrets.SERVER_PASSWORD }}
+          source: "frontend/build/*"
+          target: "/opt/cybergate/frontend/build"
+          strip_components: 2
