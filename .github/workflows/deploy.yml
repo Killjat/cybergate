@@ -43,16 +43,18 @@ jobs:
             # 重启后端
             pkill -f "uvicorn" || true
             sleep 1
-            nohup python3 -c "
-            import uvicorn, asyncio, sys
-            sys.path.insert(0, '.')
-            from main import app
-            async def run():
-                config = uvicorn.Config(app, host='127.0.0.1', port=8080)
-                await uvicorn.Server(config).serve()
-            asyncio.run(run())
-            " > /var/log/cybergate.log 2>&1 &
-            echo "后端已重启"
+            setsid python3 -c "
+import uvicorn, asyncio, sys
+sys.path.insert(0, '.')
+from main import app
+async def run():
+    config = uvicorn.Config(app, host='127.0.0.1', port=8080)
+    await uvicorn.Server(config).serve()
+asyncio.run(run())
+" > /var/log/cybergate.log 2>&1 &
+            disown
+            sleep 2
+            curl -s http://localhost:8080/ && echo "后端启动成功" || echo "后端启动失败"
 
       - name: 上传前端 build
         uses: appleboy/scp-action@v0.1.7
