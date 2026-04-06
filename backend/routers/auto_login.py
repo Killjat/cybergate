@@ -491,16 +491,23 @@ async def auto_login_github(username: str, password: str, two_factor_secret: str
 
 @router.post("/open-browser/{account_id}")
 async def open_browser(account_id: int, request: Request, db: Session = Depends(get_db)):
-    """用已有 session 打开浏览器，直接进入 google.com"""
+    """用已有 session 打开浏览器，支持指定目标 URL"""
     import requests as req
 
-    # 获取 user_id
+    # 获取 user_id 和目标 URL
     try:
         from auth import decode_token
         auth_header = request.headers.get("authorization", "")
         user_id = decode_token(auth_header[7:]).get("sub", "anonymous") if auth_header.startswith("Bearer ") else "anonymous"
     except Exception:
         user_id = "anonymous"
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    target_url = body.get("url", "https://www.google.com")
 
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
@@ -543,12 +550,12 @@ async def open_browser(account_id: int, request: Request, db: Session = Depends(
             if status.get("status") == "running":
                 break
 
-    # 打开 google.com
+    # 打开目标 URL
     tab_id = None
     for _ in range(8):
         try:
             r = req.post(f"{BASE}/instances/{inst_id}/tabs/open",
-                         json={"url": "https://www.google.com"}).json()
+                         json={"url": target_url}).json()
             tab_id = r.get("tabId") or r.get("id")
             if tab_id:
                 break
@@ -577,6 +584,45 @@ async def close_browser(instance_id: str):
     BASE = "http://localhost:9867"
     req.post(f"{BASE}/instances/{instance_id}/stop")
     return {"success": True, "message": f"instance {instance_id} 已关闭"}
+
+
+@router.get("/accounts/{account_id}/linked-platforms")
+async def get_linked_platforms(account_id: int, db: Session = Depends(get_db)):
+    """获取某个 Google 账号关联的平台列表"""
+    from models import LinkedPlatform
+    items = db.query(LinkedPlatform).filter(LinkedPlatform.account_id == account_id).all()
+    return [{"id": i.id, "platform": i.platform, "status": i.status, "logged_in_at": i.logged_in_at} for i in items]
+
+
+@router.post("/accounts/{account_id}/linked-platforms")
+async def add_linked_platform(account_id: int, body: dict, db: Session = Depends(get_db)):
+    """给 Google 账号添加关联平台（如 reddit）"""
+    from models import LinkedPlatform
+    platform = body.get("platform", "").lower()
+    if not platform:
+        raise HTTPException(status_code=400, detail="platform 不能为空")
+    exists = db.query(LinkedPlatform).filter(
+        LinkedPlatform.account_id == account_id,
+        LinkedPlatform.platform == platform
+    ).first()
+    if exists:
+        return {"id": exists.id, "platform": exists.platform, "status": exists.status}
+    lp = LinkedPlatform(account_id=account_id, platform=platform, status="pending")
+    db.add(lp)
+    db.commit()
+    db.refresh(lp)
+    return {"id": lp.id, "platform": lp.platform, "status": lp.status}
+
+
+@router.delete("/accounts/{account_id}/linked-platforms/{platform}")
+async def remove_linked_platform(account_id: int, platform: str, db: Session = Depends(get_db)):
+    from models import LinkedPlatform
+    db.query(LinkedPlatform).filter(
+        LinkedPlatform.account_id == account_id,
+        LinkedPlatform.platform == platform
+    ).delete()
+    db.commit()
+    return {"message": "已删除"}
 
 
 @router.get("/profiles")
@@ -727,6 +773,22 @@ async def start_auto_login(account_id: int, request: Request, db: Session = Depe
                 account.username, password, account.two_factor_secret, current_user_id
             )
         )
+    elif account.platform.lower() == "reddit":
+        # Reddit 用 Google 账号登录，找关联的 Google 账号
+        from models import LinkedPlatform
+        lp = db.query(LinkedPlatform).filter(
+            LinkedPlatform.account_id == account_id,
+            LinkedPlatform.platform == "reddit"
+        ).first()
+        if not lp:
+            raise HTTPException(status_code=400, detail="请先在账号详情里关联 Reddit 平台")
+        google_account = db.query(Account).filter(Account.id == lp.account_id).first()
+        loop = asyncio.get_event_loop()
+        import functools
+        login_tasks[task_id] = loop.run_in_executor(
+            None,
+            functools.partial(_run_reddit_login, google_account.username, account_id, current_user_id)
+        )
     else:
         raise HTTPException(status_code=400, detail=f"暂不支持平台: {account.platform}")
 
@@ -737,6 +799,184 @@ def _run_google_login(username, password, two_factor_secret, user_id="anonymous"
     """同步包装，供 executor 调用"""
     import asyncio as _asyncio
     return _asyncio.run(auto_login_google(username, password, two_factor_secret, user_id))
+
+
+async def auto_login_reddit(google_username: str, account_id: int, user_id: str = "anonymous"):
+    """
+    用 Google 账号登录 Reddit（Continue with Google）
+    复用 google_xxx profile，Reddit session 也存入同一个 profile
+    """
+    import requests as req, time, re
+    from database import SessionLocal
+    from models import LinkedPlatform
+
+    BASE = "http://localhost:9867"
+    account_prefix = google_username.split("@")[0].lower()
+    profile_name = f"google_{account_prefix}"
+
+    def pt_get(path): return req.get(f"{BASE}{path}", timeout=10).json()
+    def pt_post(path, body=None): return req.post(f"{BASE}{path}", json=body or {}, timeout=10).json()
+    def human_delay(a=1.5, b=3.5): time.sleep(random.uniform(a, b))
+
+    def snap(tab_id, filt="interactive"):
+        return req.get(f"{BASE}/tabs/{tab_id}/snapshot", params={"filter": filt}, timeout=10).json()
+
+    def find_ref(tab_id, hint, retries=3):
+        hint_lower = hint.lower()
+        for _ in range(retries):
+            try:
+                data = snap(tab_id)
+                for node in data.get("nodes", []):
+                    if hint_lower in node.get("name", "").lower():
+                        return node["ref"]
+            except Exception:
+                pass
+            time.sleep(1.5)
+        return None
+
+    def action(tab_id, kind, ref=None, text=None, key=None):
+        body = {"kind": kind}
+        if ref:  body["ref"] = ref
+        if text: body["text"] = text
+        if key:  body["key"] = key
+        return pt_post(f"/tabs/{tab_id}/action", body)
+
+    try:
+        # 找 Google profile
+        profiles = pt_get("/profiles")
+        profile_id = next((p["id"] for p in profiles if p.get("name") == profile_name), None)
+        if not profile_id:
+            return {"success": False, "message": f"未找到 profile {profile_name}，请先完成 Google 登录"}
+        if not next((p for p in profiles if p.get("name") == profile_name and p.get("hasAccount")), None):
+            return {"success": False, "message": "Google 账号尚未登录，请先完成 Google 登录"}
+
+        # 清理残留 instance
+        instances = pt_get("/instances")
+        for inst in (instances if isinstance(instances, list) else []):
+            if inst.get("profileId") == profile_id and inst.get("status") == "running":
+                try: pt_post(f"/instances/{inst['id']}/stop")
+                except Exception: pass
+                time.sleep(1)
+
+        # 清理 LOCK 文件
+        import os
+        prof_path = next((p["path"] for p in profiles if p["id"] == profile_id), None)
+        if prof_path:
+            lock = os.path.join(prof_path, "Default", "LOCK")
+            if os.path.exists(lock): os.remove(lock)
+
+        # 启动 instance（用 Google profile）
+        print(f"用 {profile_name} 启动浏览器...")
+        inst_info = pt_post("/instances/start", {"profileId": profile_id, "mode": "headed"})
+        inst_id = inst_info.get("id") or inst_info.get("instanceId")
+        if not inst_id:
+            return {"success": False, "message": f"启动失败: {inst_info}"}
+
+        # 等待就绪
+        for _ in range(15):
+            time.sleep(2)
+            if pt_get(f"/instances/{inst_id}").get("status") == "running":
+                break
+
+        try:
+            # 打开 Reddit
+            print("导航到 reddit.com...")
+            r = pt_post(f"/instances/{inst_id}/tabs/open", {"url": "https://www.reddit.com"})
+            tab_id = r.get("tabId") or r.get("id")
+            if not tab_id:
+                return {"success": False, "message": "无法打开 tab"}
+            human_delay(3, 5)
+
+            # 随机浏览一下
+            action(tab_id, "scroll", text="down")
+            human_delay(2, 3)
+            action(tab_id, "scroll", text="top")
+            human_delay(1, 2)
+
+            # 找登录按钮
+            print("查找登录按钮...")
+            login_ref = find_ref(tab_id, "Log In") or find_ref(tab_id, "Sign Up") or find_ref(tab_id, "login")
+            if login_ref:
+                action(tab_id, "hover", ref=login_ref)
+                human_delay(0.8, 1.5)
+                action(tab_id, "click", ref=login_ref)
+                human_delay(3, 5)
+            else:
+                pt_post(f"/tabs/{tab_id}/navigate", {"url": "https://www.reddit.com/login"})
+                human_delay(3, 5)
+
+            # 找 "Continue with Google" 按钮
+            print("查找 Continue with Google...")
+            google_ref = find_ref(tab_id, "Continue with Google") or find_ref(tab_id, "Google")
+            if not google_ref:
+                return {"success": False, "message": "未找到 Continue with Google 按钮"}
+
+            action(tab_id, "hover", ref=google_ref)
+            human_delay(0.8, 1.5)
+            action(tab_id, "click", ref=google_ref)
+            print("等待 Google 授权...")
+            human_delay(5, 8)
+
+            # Google 授权页 — 已登录状态，找账号或直接确认
+            state = snap(tab_id)
+            current_url = state.get("url", "")
+            print(f"当前 URL: {current_url}")
+
+            if "accounts.google.com" in current_url:
+                # 可能需要选择账号
+                account_ref = find_ref(tab_id, google_username) or find_ref(tab_id, google_username.split("@")[0])
+                if account_ref:
+                    print(f"选择账号: {google_username}")
+                    action(tab_id, "click", ref=account_ref)
+                    human_delay(3, 5)
+                else:
+                    # 直接点 Continue
+                    continue_ref = find_ref(tab_id, "Continue") or find_ref(tab_id, "Allow")
+                    if continue_ref:
+                        action(tab_id, "click", ref=continue_ref)
+                        human_delay(3, 5)
+
+            # 等待跳回 Reddit
+            human_delay(4, 6)
+            state = snap(tab_id)
+            current_url = state.get("url", "")
+            print(f"最终 URL: {current_url}")
+
+            if "reddit.com" in current_url and "login" not in current_url:
+                # 更新数据库 linked_platforms 状态
+                db = SessionLocal()
+                try:
+                    lp = db.query(LinkedPlatform).filter(
+                        LinkedPlatform.account_id == account_id,
+                        LinkedPlatform.platform == "reddit"
+                    ).first()
+                    if lp:
+                        from datetime import datetime
+                        lp.status = "logged_in"
+                        lp.logged_in_at = datetime.utcnow()
+                        db.commit()
+                finally:
+                    db.close()
+
+                register_instance(user_id, inst_id)
+                return {"success": True, "message": f"Reddit 登录成功（使用 {google_username}）", "instance_id": inst_id}
+            else:
+                return {"success": False, "message": f"Reddit 登录失败，当前页面: {current_url}"}
+
+        except Exception as e:
+            try: pt_post(f"/instances/{inst_id}/stop")
+            except Exception: pass
+            raise e
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "message": f"Reddit 登录失败: {str(e)}"}
+
+
+def _run_reddit_login(google_username, account_id, user_id="anonymous"):
+    import asyncio as _asyncio
+    return _asyncio.run(auto_login_reddit(google_username, account_id, user_id))
 
 @router.get("/login-status/{task_id}")
 async def get_login_status(task_id: str):

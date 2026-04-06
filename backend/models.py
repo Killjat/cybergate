@@ -48,3 +48,19 @@ class Account(Base):
     notes = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 关联的平台（用这个 Google 账号登录的其他平台）
+    linked_platforms = relationship("LinkedPlatform", back_populates="account", cascade="all, delete-orphan")
+
+
+class LinkedPlatform(Base):
+    """记录某个 Google 账号关联登录了哪些平台"""
+    __tablename__ = "linked_platforms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    platform = Column(String, nullable=False)   # reddit / quora / medium ...
+    status = Column(String, default="pending")  # pending / logged_in / failed
+    logged_in_at = Column(DateTime, nullable=True)
+
+    account = relationship("Account", back_populates="linked_platforms")

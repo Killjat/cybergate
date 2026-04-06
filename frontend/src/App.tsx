@@ -259,10 +259,10 @@ function MainApp({ currentUser, onLogout }: { currentUser: { username: string; r
     } catch { setLoginStates(prev => ({ ...prev, [id]: { status: 'failed', message: '启动失败' } })); }
   };
 
-  const handleOpenBrowser = async (account: Account) => {
+  const handleOpenBrowser = async (account: Account, url?: string) => {
     try {
       message.loading({ content: '正在打开...', key: `open_${account.id}` });
-      const res = await axios.post(`${API}/open-browser/${account.id}`);
+      const res = await axios.post(`${API}/open-browser/${account.id}`, url ? { url } : {});
       setBrowserInstances(prev => ({ ...prev, [account.id]: res.data.instance_id }));
       message.success({ content: '浏览器已打开', key: `open_${account.id}` });
     } catch (e: any) { message.error({ content: e.response?.data?.detail || '打开失败', key: `open_${account.id}` }); }
@@ -293,8 +293,15 @@ function MainApp({ currentUser, onLogout }: { currentUser: { username: string; r
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         {loginButton(r)}
         {!isGuest && <Button size="small" style={browserInstances[r.id] ? { background: '#fa8c16', color: '#fff', border: 'none' } : {}} onClick={() => browserInstances[r.id] ? handleCloseBrowser(r) : handleOpenBrowser(r)}>{browserInstances[r.id] ? '关闭' : '打开浏览器'}</Button>}
+        {!isGuest && r.platform === 'google' && <Button size="small" style={{ background: '#ff4500', color: '#fff', border: 'none' }} onClick={() => handleOpenBrowser(r, 'https://www.reddit.com')}>Reddit</Button>}
         {isAdmin && <>
           <Button size="small" onClick={() => { setEditingAccount(r); editForm.setFieldsValue({ ...r, password: '' }); setIsEditModalVisible(true); }}>编辑</Button>
+          <Button size="small" onClick={async () => {
+            const platform = window.prompt('添加关联平台（如 reddit）:');
+            if (!platform) return;
+            try { await axios.post(`${API}/accounts/${r.id}/linked-platforms`, { platform }); message.success(`已关联 ${platform}`); }
+            catch (e: any) { message.error(e.response?.data?.detail || '失败'); }
+          }}>+ 关联</Button>
           <Button size="small" onClick={async () => {
             try {
               const res = await fetch(`${API}/profiles/${r.id}/export`, { headers: { Authorization: `Bearer ${localStorage.getItem('cg_token')}` } });
