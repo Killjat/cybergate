@@ -1,0 +1,19 @@
+# 敏感文件
+*.key
+*.db
+backend/backend.log
+backend/user_actions.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node
+frontend/node_modules/
+frontend/build/
+
+# 系统
+.DS_Store
+*.log
