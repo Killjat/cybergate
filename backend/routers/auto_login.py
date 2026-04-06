@@ -11,6 +11,8 @@ from utils_audit import log_access_action
 from playwright.async_api import async_playwright
 import asyncio
 import random
+import os
+from pinchtab_client import pt_get as _pt_get, pt_post as _pt_post, PINCHTAB_BASE as _PT_BASE
 
 router = APIRouter()
 
@@ -67,33 +69,23 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
     自动登录 Google - 通过 PinchTab HTTP API 控制 Chrome
     流程: 空白页 -> 地址栏输入 google.com -> 点击登录 -> 输入账号密码 -> 处理 2FA
     """
+    from pinchtab_client import pt_get, pt_post, PINCHTAB_BASE as BASE
     import requests as req
     import time
-
-    BASE = "http://localhost:9867"
-
-    def pt_get(path, **kwargs):
-        return req.get(f"{BASE}{path}", **kwargs).json()
-
-    def pt_post(path, body=None):
-        return req.post(f"{BASE}{path}", json=body or {}).json()
 
     def human_delay(a=1.5, b=3.5):
         time.sleep(random.uniform(a, b))
 
     def snap(tab_id, filt="interactive"):
-        """获取页面可交互元素快照"""
-        return req.get(f"{BASE}/tabs/{tab_id}/snapshot", params={"filter": filt}).json()
+        return pt_get(f"/tabs/{tab_id}/snapshot", params={"filter": filt})
 
     def find_ref(tab_id, hint, retries=3):
-        """从 snapshot 里按名字找元素，返回 ref，支持重试"""
         hint_lower = hint.lower()
         for _ in range(retries):
             try:
-                data = snap(tab_id, filt="interactive")
+                data = snap(tab_id)
                 for node in data.get("nodes", []):
-                    name = node.get("name", "").lower()
-                    if hint_lower in name or name in hint_lower:
+                    if hint_lower in node.get("name", "").lower():
                         return node["ref"]
             except Exception:
                 pass
@@ -101,10 +93,9 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
         return None
 
     def find_textbox(tab_id, retries=3):
-        """找页面上第一个 textbox"""
         for _ in range(retries):
             try:
-                data = snap(tab_id, filt="interactive")
+                data = snap(tab_id)
                 for node in data.get("nodes", []):
                     if node.get("role") == "textbox":
                         return node["ref"]
@@ -122,7 +113,6 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
         return pt_post(f"/tabs/{tab_id}/action", body)
 
     def type_human(tab_id, ref, text):
-        """逐字符输入，模拟人类打字速度"""
         action(tab_id, "focus", ref=ref)
         time.sleep(0.3)
         for char in text:
@@ -134,16 +124,6 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
     # ── profile: google_<邮箱前缀> ──────────────────────────────────
     account_prefix = username.split("@")[0].lower()
     profile_name = f"google_{account_prefix}"
-
-    import requests as req
-    import time
-    BASE = "http://localhost:9867"
-
-    def pt_get(path):
-        return req.get(f"{BASE}{path}").json()
-
-    def pt_post(path, body=None):
-        return req.post(f"{BASE}{path}", json=body or {}).json()
 
     try:
         print("连接 PinchTab...")
@@ -163,12 +143,12 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
         # 先检查是否有残留 instance，有则先停掉
         print("检查残留 instance...")
         try:
-            instances = req.get(f"{BASE}/instances", timeout=10).json()
+            instances = _pt_get(f"{_PT_BASE}/instances", timeout=10).json()
             for inst in (instances if isinstance(instances, list) else []):
                 if inst.get("profileId") == profile_id and inst.get("status") == "running":
                     print(f"停掉残留 instance: {inst['id']}")
                     try:
-                        req.post(f"{BASE}/instances/{inst['id']}/stop", timeout=10)
+                        _pt_post(f"{_PT_BASE}/instances/{inst['id']}/stop", timeout=10)
                     except Exception:
                         pass
                     time.sleep(1)
@@ -195,7 +175,7 @@ async def auto_login_google(username: str, password: str, two_factor_secret: str
         # 等待 instance 变成 running
         for _ in range(15):
             time.sleep(2)
-            status = req.get(f"{BASE}/instances/{inst_id}").json()
+            status = _pt_get(f"{_PT_BASE}/instances/{inst_id}").json()
             if status.get("status") == "running":
                 print("Chrome 已就绪")
                 break
@@ -513,40 +493,39 @@ async def open_browser(account_id: int, request: Request, db: Session = Depends(
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    BASE = "http://localhost:9867"
     account_prefix = account.username.split("@")[0].lower()
     profile_name = f"google_{account_prefix}"
 
     # 找 profile
-    profiles = req.get(f"{BASE}/profiles").json()
+    profiles = _pt_get(f"{_PT_BASE}/profiles").json()
     profile_id = next((p["id"] for p in profiles if p.get("name") == profile_name), None)
     if not profile_id:
         raise HTTPException(status_code=404, detail=f"未找到 profile {profile_name}，请先登录")
 
     # 检查是否已有 running instance，有则复用
     import time
-    instances = req.get(f"{BASE}/instances").json()
+    instances = _pt_get(f"{_PT_BASE}/instances").json()
     inst_id = next((i["id"] for i in instances
                     if i.get("profileId") == profile_id and i.get("status") == "running"), None)
 
     if not inst_id:
         # 清理 LOCK 文件
         import os
-        profiles_info = req.get(f"{BASE}/profiles").json()
+        profiles_info = _pt_get(f"{_PT_BASE}/profiles").json()
         prof_path = next((p["path"] for p in profiles_info if p["id"] == profile_id), None)
         if prof_path:
             lock_file = os.path.join(prof_path, "Default", "LOCK")
             if os.path.exists(lock_file):
                 os.remove(lock_file)
 
-        inst_info = req.post(f"{BASE}/instances/start", json={"profileId": profile_id, "mode": "headed"}).json()
+        inst_info = _pt_post(f"{_PT_BASE}/instances/start", json={"profileId": profile_id, "mode": "headed"}).json()
         inst_id = inst_info.get("id") or inst_info.get("instanceId")
         if not inst_id:
             raise HTTPException(status_code=500, detail=f"启动失败: {inst_info}")
         # 等待 instance 变成 running 状态
         for _ in range(15):
             time.sleep(2)
-            status = req.get(f"{BASE}/instances/{inst_id}").json()
+            status = _pt_get(f"{_PT_BASE}/instances/{inst_id}").json()
             if status.get("status") == "running":
                 break
 
@@ -554,7 +533,7 @@ async def open_browser(account_id: int, request: Request, db: Session = Depends(
     tab_id = None
     for _ in range(8):
         try:
-            r = req.post(f"{BASE}/instances/{inst_id}/tabs/open",
+            r = _pt_post(f"{_PT_BASE}/instances/{inst_id}/tabs/open",
                          json={"url": target_url}).json()
             tab_id = r.get("tabId") or r.get("id")
             if tab_id:
@@ -581,8 +560,7 @@ async def open_browser(account_id: int, request: Request, db: Session = Depends(
 async def close_browser(instance_id: str):
     """关闭指定 instance"""
     import requests as req
-    BASE = "http://localhost:9867"
-    req.post(f"{BASE}/instances/{instance_id}/stop")
+    _pt_post(f"{_PT_BASE}/instances/{instance_id}/stop")
     return {"success": True, "message": f"instance {instance_id} 已关闭"}
 
 
@@ -629,10 +607,9 @@ async def remove_linked_platform(account_id: int, platform: str, db: Session = D
 async def list_profiles(db: Session = Depends(get_db)):
     """列出所有账号对应的 profile 状态，供情报采集系统查询"""
     import requests as req
-    BASE = "http://localhost:9867"
 
     accounts = db.query(Account).all()
-    pinchtab_profiles = req.get(f"{BASE}/profiles", timeout=5).json()
+    pinchtab_profiles = _pt_get(f"{_PT_BASE}/profiles", timeout=5).json()
     profile_map = {p["name"]: p for p in pinchtab_profiles}
 
     result = []
@@ -658,7 +635,6 @@ async def export_profile(account_id: int, db: Session = Depends(get_db)):
     """打包下载指定账号的 Chrome Profile，供情报采集系统部署到远程节点"""
     import requests as req, tarfile, io, os
     from fastapi.responses import StreamingResponse
-    BASE = "http://localhost:9867"
 
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
@@ -668,7 +644,7 @@ async def export_profile(account_id: int, db: Session = Depends(get_db)):
     profile_name = f"google_{prefix}"
 
     # 找 profile 路径
-    profiles = req.get(f"{BASE}/profiles", timeout=5).json()
+    profiles = _pt_get(f"{_PT_BASE}/profiles", timeout=5).json()
     profile = next((p for p in profiles if p.get("name") == profile_name), None)
     if not profile:
         raise HTTPException(status_code=404, detail=f"Profile {profile_name} 不存在，请先登录")
@@ -699,7 +675,6 @@ async def export_profile(account_id: int, db: Session = Depends(get_db)):
 async def logout(body: dict = {}, request: Request = None):
     """用户退出时关闭所有该用户的 instances"""
     import requests as req
-    BASE = "http://localhost:9867"
 
     # 从 token 拿 user_id
     user_id = "anonymous"
@@ -719,7 +694,7 @@ async def logout(body: dict = {}, request: Request = None):
     closed = []
     for inst_id in ids_to_close:
         try:
-            req.post(f"{BASE}/instances/{inst_id}/stop", timeout=3)
+            _pt_post(f"{_PT_BASE}/instances/{inst_id}/stop", timeout=3)
             closed.append(inst_id)
         except Exception:
             pass
@@ -810,16 +785,15 @@ async def auto_login_reddit(google_username: str, account_id: int, user_id: str 
     from database import SessionLocal
     from models import LinkedPlatform
 
-    BASE = "http://localhost:9867"
     account_prefix = google_username.split("@")[0].lower()
     profile_name = f"google_{account_prefix}"
 
-    def pt_get(path): return req.get(f"{BASE}{path}", timeout=10).json()
-    def pt_post(path, body=None): return req.post(f"{BASE}{path}", json=body or {}, timeout=10).json()
+    def pt_get(path): return _pt_get(f"{_PT_BASE}{path}", timeout=10).json()
+    def pt_post(path, body=None): return _pt_post(f"{_PT_BASE}{path}", json=body or {}, timeout=10).json()
     def human_delay(a=1.5, b=3.5): time.sleep(random.uniform(a, b))
 
     def snap(tab_id, filt="interactive"):
-        return req.get(f"{BASE}/tabs/{tab_id}/snapshot", params={"filter": filt}, timeout=10).json()
+        return _pt_get(f"{_PT_BASE}/tabs/{tab_id}/snapshot", params={"filter": filt}, timeout=10).json()
 
     def find_ref(tab_id, hint, retries=3):
         hint_lower = hint.lower()
